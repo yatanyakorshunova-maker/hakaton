@@ -10,53 +10,150 @@ from torch.nn import functional as F
 class Policy(nn.Module):
     def __init__(self, obs_dim: int, action_dim: int, hidden_size: int):
         super().__init__()
+
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.hidden_size = hidden_size
+
+        input_dim = obs_dim + action_dim + 3
+
         self.encoder = nn.Sequential(
-            nn.Linear(obs_dim + action_dim + 3, hidden_size),
+            nn.Linear(input_dim, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.Tanh(),
+
+            nn.Linear(hidden_size, hidden_size),
             nn.Tanh(),
         )
+
         self.memory = nn.GRUCell(hidden_size, hidden_size)
-        self.actor = nn.Linear(hidden_size, action_dim)
-        self.critic = nn.Linear(hidden_size, 1)
-        for layer in (self.encoder[0], self.actor, self.critic):
-            nn.init.orthogonal_(layer.weight, math.sqrt(2))
-            nn.init.zeros_(layer.bias)
-        nn.init.orthogonal_(self.actor.weight, 0.01)
-        nn.init.orthogonal_(self.critic.weight, 1.0)
-        # С самого начала марсоход чаще пробует ехать вперёд; PPO меняет эти веса.
-        with torch.no_grad():
-            self.actor.bias.fill_(-1.0)
-            self.actor.bias[1] = 3.5
-            self.actor.bias[5] = 0.75
+
+        self.actor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, action_dim),
+        )
+
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.orthogonal_(module.weight, math.sqrt(2))
+                nn.init.zeros_(module.bias)
+
+        nn.init.orthogonal_(self.actor[-1].weight, 0.01)
+        nn.init.zeros_(self.actor[-1].bias)
+
+        nn.init.orthogonal_(self.critic[-1].weight, 1.0)
+        nn.init.zeros_(self.critic[-1].bias)
 
     def initial(self, batch: int, device: torch.device) -> torch.Tensor:
-        return torch.zeros(batch, self.hidden_size, device=device)
+        return torch.zeros(
+            batch,
+            self.hidden_size,
+            device=device,
+        )
 
-    def step(self, observation, previous_action, previous_reward, previous_done,
-             trial_progress, trial_start, memory):
-        memory = memory * (1 - trial_start.float().unsqueeze(-1))
-        encoded_action = F.one_hot(previous_action, self.action_dim).float()
-        features = torch.cat((
+    def _features(
+        self,
+        observation,
+        previous_action,
+        previous_reward,
+        previous_done,
+        trial_progress,
+    ):
+        action = F.one_hot(
+            previous_action.long(),
+            self.action_dim,
+        ).float()
+
+        reward = torch.tanh(
+            previous_reward.unsqueeze(-1) / 10.0
+        )
+
+        done = previous_done.float().unsqueeze(-1)
+
+        progress = trial_progress.float().unsqueeze(-1)
+
+        return torch.cat(
+            (
+                observation,
+                action,
+                reward,
+                done,
+                progress,
+            ),
+            dim=-1,
+        )
+
+    def step(
+        self,
+        observation,
+        previous_action,
+        previous_reward,
+        previous_done,
+        trial_progress,
+        trial_start,
+        memory,
+    ):
+        reset_mask = trial_start.float().unsqueeze(-1)
+        memory = memory * (1.0 - reset_mask)
+
+        features = self._features(
             observation,
-            encoded_action,
-            torch.tanh(previous_reward.unsqueeze(-1) / 10),
-            previous_done.unsqueeze(-1),
-            trial_progress.unsqueeze(-1),
-        ), dim=-1)
-        memory = self.memory(self.encoder(features), memory)
-        return self.actor(memory), self.critic(memory).squeeze(-1), memory
+            previous_action,
+            previous_reward,
+            previous_done,
+            trial_progress,
+        )
 
-    def sequence(self, observation, previous_action, previous_reward, previous_done,
-                 trial_progress, trial_start, memory):
+        encoded = self.encoder(features)
+
+        memory = self.memory(
+            encoded,
+            memory,
+        )
+
+        logits = self.actor(memory)
+        value = self.critic(memory).squeeze(-1)
+
+        return logits, value, memory
+
+    def sequence(
+        self,
+        observation,
+        previous_action,
+        previous_reward,
+        previous_done,
+        trial_progress,
+        trial_start,
+        memory,
+    ):
         logits = []
         values = []
-        for index in range(len(observation)):
-            current_logits, current_values, memory = self.step(
-                observation[index], previous_action[index], previous_reward[index],
-                previous_done[index], trial_progress[index], trial_start[index], memory,
+
+        for i in range(len(observation)):
+            current_logits, current_value, memory = self.step(
+                observation[i],
+                previous_action[i],
+                previous_reward[i],
+                previous_done[i],
+                trial_progress[i],
+                trial_start[i],
+                memory,
             )
+
             logits.append(current_logits)
-            values.append(current_values)
-        return torch.stack(logits), torch.stack(values)
+            values.append(current_value)
+
+        return (
+            torch.stack(logits),
+            torch.stack(values),
+        )
